@@ -1,31 +1,17 @@
 # chessiro-engines
 
-WASM engine pack and browser test pages for Chessiro.
+Production-focused WASM Stockfish builds for Chessiro.
 
-This repo currently ships:
+## Engines
 
-- `SF18 Compat ST (ours)`
-- `SF18 Compat MT (ours)`
-- `Chess.com SF17 Lite ST` reference build (for A/B testing)
+- `sf18-compat-st` (single-thread)
+  - Files: `engines/compat/sf18-compat-st.js`, `engines/compat/sf18-compat-st.wasm`
+  - Best fallback for all browsers/devices
+- `sf18-compat-mt` (multi-thread)
+  - Files: `engines/compat/sf18-compat-mt.js`, `engines/compat/sf18-compat-mt.wasm`
+  - Higher throughput when `SharedArrayBuffer` is available
 
-## Repo Layout
-
-- `engines/compat/`
-  - `sf18-compat-st.js`
-  - `sf18-compat-st.wasm`
-  - `sf18-compat-mt.js`
-  - `sf18-compat-mt.wasm`
-- `engines/reference/`
-  - `stockfish-17-lite-single.js`
-  - `stockfish-17-lite-single.wasm`
-- `pages/`
-  - `bench-compat-vs-chesscom.html`
-  - `match-2games-compat-vs-chesscom.html`
-  - `match-depth-handicap-no-draw.html`
-- `tools/`
-  - `serve.py` (local COOP/COEP static server)
-
-## Quick Start
+## Quick Start (Local)
 
 From repo root:
 
@@ -35,17 +21,52 @@ python3 tools/serve.py 8090
 
 Open:
 
-- `http://localhost:8090/pages/bench-compat-vs-chesscom.html`
-- `http://localhost:8090/pages/match-2games-compat-vs-chesscom.html`
-- `http://localhost:8090/pages/match-depth-handicap-no-draw.html`
+- `http://localhost:8090/pages/`
 
-## Notes
+## Using The Engine In Your App
 
-- Use Chrome/Edge for stable Worker timing.
-- MT engine needs SharedArrayBuffer-compatible environment (COOP/COEP).
-- No-draw/eval-tiebreak match modes are useful for quick separation but are not a strict Elo measurement.
+### Single-thread (recommended default)
+
+```js
+const engine = new Worker('/engines/compat/sf18-compat-st.js');
+
+engine.onmessage = (e) => {
+  const line = String(e.data || '');
+  console.log(line);
+};
+
+engine.postMessage('uci');
+engine.postMessage('isready');
+engine.postMessage('ucinewgame');
+engine.postMessage('position startpos');
+engine.postMessage('go movetime 1000');
+```
+
+### Multi-thread (when SAB is enabled)
+
+```js
+const engine = new Worker('/engines/compat/sf18-compat-mt.js');
+
+engine.onmessage = (e) => {
+  const line = String(e.data || '');
+  console.log(line);
+};
+
+engine.postMessage('uci');
+engine.postMessage('setoption name Threads value 4');
+engine.postMessage('isready');
+engine.postMessage('position startpos');
+engine.postMessage('go movetime 1000');
+```
+
+## Deployment Notes
+
+- For MT builds, serve with cross-origin isolation headers:
+  - `Cross-Origin-Opener-Policy: same-origin`
+  - `Cross-Origin-Embedder-Policy: require-corp`
+- Keep `.js` and `.wasm` together at stable URLs.
+- Prefer gzip/brotli for network transfer.
 
 ## License
 
-`LICENSE` in this repo applies.
-
+See `LICENSE`.
