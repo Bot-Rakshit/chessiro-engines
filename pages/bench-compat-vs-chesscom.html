@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Compat ST vs Chess.com Lite ST Benchmark</title>
+<style>
+  :root {
+    --bg: #0f1220;
+    --panel: #161b2c;
+    --text: #e8ecff;
+    --muted: #9aa6d1;
+    --ok: #5af2a6;
+    --warn: #ffb454;
+    --bad: #ff6b6b;
+    --line: #2a3252;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    background: radial-gradient(1200px 700px at 10% 0%, #1a2140 0%, var(--bg) 50%);
+    color: var(--text);
+  }
+  .wrap {
+    max-width: 1100px;
+    margin: 24px auto;
+    padding: 0 16px;
+  }
+  h1 {
+    margin: 0 0 12px;
+    font-size: 20px;
+    color: var(--ok);
+  }
+  .sub {
+    margin-bottom: 16px;
+    color: var(--muted);
+    font-size: 13px;
+  }
+  .panel {
+    background: color-mix(in srgb, var(--panel) 92%, black);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 14px;
+    margin-bottom: 14px;
+  }
+  .controls {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(120px, 1fr));
+    gap: 10px;
+    align-items: end;
+  }
+  label {
+    display: block;
+    color: var(--muted);
+    font-size: 12px;
+    margin-bottom: 4px;
+  }
+  input {
+    width: 100%;
+    padding: 8px 9px;
+    border-radius: 8px;
+    border: 1px solid var(--line);
+    background: #11162a;
+    color: var(--text);
+    font: inherit;
+  }
+  .btns {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  button {
+    border: 1px solid var(--line);
+    color: var(--text);
+    background: #151c35;
+    padding: 9px 12px;
+    border-radius: 8px;
+    font: inherit;
+    cursor: pointer;
+  }
+  button:hover { border-color: #4c5ea2; }
+  button.primary {
+    background: linear-gradient(180deg, #1d2b59, #192349);
+    border-color: #5071df;
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+  }
+  .kpi {
+    background: #0f152a;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 10px;
+  }
+  .kpi .name {
+    color: var(--muted);
+    font-size: 12px;
+    margin-bottom: 6px;
+  }
+  .kpi .value {
+    font-size: 20px;
+    font-weight: 700;
+    color: var(--ok);
+  }
+  .status {
+    color: var(--warn);
+    font-size: 13px;
+    margin-top: 8px;
+    min-height: 18px;
+  }
+  #log {
+    max-height: 52vh;
+    overflow: auto;
+    white-space: pre-wrap;
+    line-height: 1.35;
+    font-size: 12px;
+    color: #dce2ff;
+    background: #0d1225;
+    border: 1px solid #222d4d;
+    border-radius: 10px;
+    padding: 10px;
+  }
+  .ok { color: var(--ok); }
+  .bad { color: var(--bad); }
+  @media (max-width: 880px) {
+    .controls { grid-template-columns: 1fr 1fr; }
+    .grid { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Benchmark: SF18 Compat ST vs Chess.com Lite ST</h1>
+    <div class="sub">Goal: compare speed on the same 6.3MB net family in-browser (single thread, no Node bias).</div>
+
+    <div class="panel">
+      <div class="controls">
+        <div>
+          <label for="movetime">Movetime per Position (ms)</label>
+          <input id="movetime" type="number" value="1200" min="100" step="100">
+        </div>
+        <div>
+          <label for="depth">Fallback Depth (if movetime=0)</label>
+          <input id="depth" type="number" value="12" min="4" step="1">
+        </div>
+        <div>
+          <label for="rounds">Rounds</label>
+          <input id="rounds" type="number" value="1" min="1" step="1">
+        </div>
+        <div class="btns">
+          <button id="runBtn" class="primary">Run Benchmark</button>
+          <button id="stopBtn">Stop</button>
+          <button id="clearBtn">Clear Log</button>
+        </div>
+      </div>
+      <div id="status" class="status"></div>
+    </div>
+
+    <div class="grid">
+      <div class="kpi">
+        <div class="name">SF18 Compat ST (ours)</div>
+        <div class="value" id="oursNps">-</div>
+      </div>
+      <div class="kpi">
+        <div class="name">Chess.com SF17 Lite ST</div>
+        <div class="value" id="chesscomNps">-</div>
+      </div>
+      <div class="kpi">
+        <div class="name">Delta (ours vs chess.com)</div>
+        <div class="value" id="deltaPct">-</div>
+      </div>
+      <div class="kpi">
+        <div class="name">Note</div>
+        <div class="value" id="noteTxt" style="font-size:14px;color:var(--muted);font-weight:600;">Use Chrome/Edge for stable Worker timing.</div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div id="log"></div>
+    </div>
+  </div>
+
+<script>
+const POSITIONS = [
+  { name: "Start", fen: "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1" },
+  { name: "Open Center", fen: "rnbqkb1r/pppp1ppp/5n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 2 3" },
+  { name: "Middlegame A", fen: "rnbq1rk1/pp2bppp/2pp1n2/8/2PNP3/2N1B3/PP3PPP/R2QKB1R w KQ - 0 8" },
+  { name: "Middlegame B", fen: "r1bq1rk1/pppn1ppp/3bpn2/3p4/3P4/2NBPN2/PPQ2PPP/R1B2RK1 w - - 0 8" },
+  { name: "Middlegame C", fen: "r4rk1/pp2qppp/2npbn2/2p5/2P1P3/2N1BN2/PPQ2PPP/R4RK1 w - - 0 12" },
+  { name: "Kingside Pressure", fen: "r1bq1rk1/pp3pbp/2np1np1/2p1p3/2P1P3/2N2NP1/PP2PPBP/R1BQ1RK1 w - - 0 8" }
+];
+
+const ENGINES = [
+  { key: "ours", name: "SF18 Compat ST (ours)", file: "../engines/compat/sf18-compat-st.js" },
+  { key: "chesscom", name: "Chess.com SF17 Lite ST", file: "../engines/reference/stockfish-17-lite-single.js" }
+];
+
+let stopped = false;
+let liveWorkers = [];
+
+const logEl = document.getElementById("log");
+const statusEl = document.getElementById("status");
+const oursNpsEl = document.getElementById("oursNps");
+const chesscomNpsEl = document.getElementById("chesscomNps");
+const deltaPctEl = document.getElementById("deltaPct");
+
+function setStatus(msg) { statusEl.textContent = msg; }
+function fmt(n) { return Number(n).toLocaleString("en-US"); }
+function log(msg, cls) {
+  const d = document.createElement("div");
+  d.textContent = msg;
+  if (cls) d.className = cls;
+  logEl.appendChild(d);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+class WorkerEngine {
+  constructor(def) {
+    this.def = def;
+    this.worker = null;
+    this.lines = [];
+    this.pending = [];
+  }
+
+  _emit(line) {
+    const idx = this.lines.push(line) - 1;
+    const survivors = [];
+    for (const p of this.pending) {
+      if (idx >= p.sinceIdx && p.pred(line)) {
+        clearTimeout(p.timer);
+        p.resolve(line);
+      } else {
+        survivors.push(p);
+      }
+    }
+    this.pending = survivors;
+  }
+
+  waitFor(pred, timeoutMs = 60000, sinceIdx = 0) {
+    for (let i = Math.max(0, sinceIdx); i < this.lines.length; i += 1) {
+      if (pred(this.lines[i])) return Promise.resolve(this.lines[i]);
+    }
+    return new Promise((resolve, reject) => {
+      const pending = {
+        sinceIdx,
+        pred,
+        resolve,
+        timer: setTimeout(() => {
+          this.pending = this.pending.filter((x) => x !== pending);
+          reject(new Error(this.def.name + " timeout"));
+        }, timeoutMs)
+      };
+      this.pending.push(pending);
+    });
+  }
+
+  send(cmd) { this.worker.postMessage(cmd); }
+
+  async init() {
+    this.worker = new Worker(this.def.file);
+    liveWorkers.push(this.worker);
+    this.worker.onmessage = (e) => {
+      const raw = e && typeof e.data !== "undefined" ? e.data : "";
+      const text = typeof raw === "string"
+        ? raw
+        : raw && typeof raw === "object" && typeof raw.text === "string"
+          ? raw.text
+          : raw && typeof raw === "object" && typeof raw.line === "string"
+            ? raw.line
+            : raw && typeof raw === "object" && typeof raw.message === "string"
+              ? raw.message
+              : raw && typeof raw === "object" && typeof raw.output === "string"
+                ? raw.output
+                : String(raw);
+      for (const line of text.split(/\r?\n/)) {
+        const clean = line.trim();
+        if (clean) this._emit(clean);
+      }
+    };
+    this.worker.onerror = (e) => this._emit("ERROR: " + (e.message || "worker error"));
+
+    this.send("uci");
+    await this.waitFor((l) => l.trim() === "uciok", 30000);
+    this.send("setoption name Threads value 1");
+    this.send("setoption name Hash value 16");
+    this.send("isready");
+    await this.waitFor((l) => l.trim() === "readyok", 30000);
+    this.lines = [];
+  }
+
+  async searchPosition(fen, cfg) {
+    const startIdx = this.lines.length;
+    this.send("position fen " + fen);
+    const wallStart = performance.now();
+    if (cfg.movetime > 0) this.send("go movetime " + cfg.movetime);
+    else this.send("go depth " + cfg.depth);
+    await this.waitFor((l) => l.startsWith("bestmove "), Math.max(90000, cfg.movetime + 15000), startIdx);
+    const wallMs = performance.now() - wallStart;
+
+    let best = null;
+    for (let i = startIdx; i < this.lines.length; i += 1) {
+      const line = this.lines[i];
+      if (!line.startsWith("info ")) continue;
+      const d = Number((line.match(/\bdepth\s+(\d+)/) || [])[1]);
+      const n = Number((line.match(/\bnodes\s+(\d+)/) || [])[1]);
+      const nps = Number((line.match(/\bnps\s+(\d+)/) || [])[1]);
+      if (!Number.isFinite(d) || !Number.isFinite(n)) continue;
+      if (!best || d > best.depth || (d === best.depth && n > best.nodes)) {
+        best = { depth: d, nodes: n, nps: Number.isFinite(nps) ? nps : 0 };
+      }
+    }
+    if (!best) {
+      const sample = this.lines.slice(startIdx, Math.min(this.lines.length, startIdx + 8)).join(" | ");
+      log("[" + this.def.key + "] no info lines captured; sample=" + (sample || "(none)"), "bad");
+      return { depth: 0, nodes: 0, nps: 0, wallMs: wallMs };
+    }
+    return { depth: best.depth, nodes: best.nodes, nps: best.nps, wallMs: wallMs };
+  }
+
+  close() {
+    try { this.send("quit"); } catch {}
+    try { this.worker.terminate(); } catch {}
+  }
+}
+
+function cleanupWorkers() {
+  for (const w of liveWorkers) {
+    try { w.terminate(); } catch {}
+  }
+  liveWorkers = [];
+}
+
+async function runBenchmark() {
+  stopped = false;
+  cleanupWorkers();
+  const movetime = Math.max(0, Number(document.getElementById("movetime").value) || 1200);
+  const depth = Math.max(4, Number(document.getElementById("depth").value) || 12);
+  const rounds = Math.max(1, Number(document.getElementById("rounds").value) || 1);
+  const cfg = { movetime, depth, rounds };
+
+  oursNpsEl.textContent = "-";
+  chesscomNpsEl.textContent = "-";
+  deltaPctEl.textContent = "-";
+
+  log("");
+  log("=== Benchmark Start ===", "ok");
+  log("Mode: " + (movetime > 0 ? ("movetime " + movetime + "ms") : ("depth " + depth)) + ", rounds=" + rounds);
+  log("Positions: " + POSITIONS.length);
+
+  const engines = [];
+  for (const def of ENGINES) {
+    if (stopped) return;
+    setStatus("Loading " + def.name + "...");
+    log("Loading " + def.name + "...");
+    const eng = new WorkerEngine(def);
+    await eng.init();
+    engines.push(eng);
+    log("  ready", "ok");
+  }
+
+  const totals = Object.fromEntries(ENGINES.map(e => [e.key, {nodes: 0, ms: 0, samples: 0}]));
+
+  for (let r = 1; r <= rounds; r += 1) {
+    if (stopped) break;
+    log("");
+    log("Round " + r + "/" + rounds, "ok");
+    for (let p = 0; p < POSITIONS.length; p += 1) {
+      if (stopped) break;
+      const pos = POSITIONS[p];
+      for (const eng of engines) {
+        if (stopped) break;
+        setStatus("Running " + eng.def.name + " on " + pos.name + "...");
+        const out = await eng.searchPosition(pos.fen, cfg);
+        totals[eng.def.key].nodes += out.nodes;
+        totals[eng.def.key].ms += out.wallMs;
+        totals[eng.def.key].samples += 1;
+        const comp = out.wallMs > 0 ? Math.round((out.nodes * 1000) / out.wallMs) : 0;
+        log("[" + eng.def.key + "] " + pos.name + " d" + out.depth + " nodes=" + fmt(out.nodes) + " nps=" + fmt(comp));
+      }
+    }
+  }
+
+  for (const eng of engines) eng.close();
+  cleanupWorkers();
+  setStatus(stopped ? "Stopped." : "Done.");
+
+  const ours = totals.ours;
+  const cc = totals.chesscom;
+  const oursNps = ours.ms > 0 ? Math.round((ours.nodes * 1000) / ours.ms) : 0;
+  const ccNps = cc.ms > 0 ? Math.round((cc.nodes * 1000) / cc.ms) : 0;
+  const delta = ccNps > 0 ? ((oursNps - ccNps) / ccNps) * 100 : 0;
+
+  oursNpsEl.textContent = fmt(oursNps) + " NPS";
+  chesscomNpsEl.textContent = fmt(ccNps) + " NPS";
+  deltaPctEl.textContent = (delta >= 0 ? "+" : "") + delta.toFixed(2) + "%";
+  deltaPctEl.style.color = delta >= 0 ? "var(--ok)" : "var(--bad)";
+
+  log("");
+  log("=== Summary ===", "ok");
+  log("ours:      " + fmt(oursNps) + " NPS");
+  log("chess.com: " + fmt(ccNps) + " NPS");
+  log("delta:     " + (delta >= 0 ? "+" : "") + delta.toFixed(2) + "%", delta >= 0 ? "ok" : "bad");
+}
+
+document.getElementById("runBtn").addEventListener("click", async () => {
+  try {
+    await runBenchmark();
+  } catch (err) {
+    log("ERROR: " + (err && err.message ? err.message : String(err)), "bad");
+    setStatus("Failed.");
+    cleanupWorkers();
+  }
+});
+
+document.getElementById("stopBtn").addEventListener("click", () => {
+  stopped = true;
+  setStatus("Stopping...");
+  cleanupWorkers();
+});
+
+document.getElementById("clearBtn").addEventListener("click", () => {
+  logEl.textContent = "";
+  setStatus("");
+});
+</script>
+</body>
+</html>
