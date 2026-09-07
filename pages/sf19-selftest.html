@@ -1,0 +1,117 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Chessiro SF19 self-test</title>
+<style>
+  body { font: 14px/1.4 ui-monospace, Menlo, monospace; margin: 24px; color: #222; }
+  pre { background: #f4f4f4; padding: 12px; overflow: auto; max-height: 50vh; }
+  .ok { color: #0a7d1c; } .bad { color: #b00020; }
+  select, button { font: inherit; }
+</style>
+</head>
+<body>
+<h2>Chessiro Stockfish 19 WASM self-test</h2>
+<p>
+  Variant:
+  <select id="variant">
+    <option value="auto">auto (feature detection)</option>
+    <option value="sf19-mt-relaxed">sf19-mt-relaxed</option>
+    <option value="sf19-mt">sf19-mt</option>
+    <option value="sf19-st-relaxed">sf19-st-relaxed</option>
+    <option value="sf19-st">sf19-st</option>
+    <option value="sf19-st-nosimd">sf19-st-nosimd</option>
+  </select>
+  Depth: <input id="depth" value="16" size="3">
+  <button id="run">Run</button>
+</p>
+<div id="features"></div>
+<div id="status"></div>
+<pre id="log"></pre>
+
+<script src="../engines/sf19/chessiro-sf19.js"></script>
+<script>
+(function () {
+  var logEl = document.getElementById('log');
+  var statusEl = document.getElementById('status');
+  var results = { lines: [] };
+  window.__results = results;
+
+  function log(s) { logEl.textContent += s + "\n"; results.lines.push(s); }
+  function setStatus(s, ok) { statusEl.innerHTML = '<span class="' + (ok ? 'ok' : 'bad') + '">' + s + '</span>'; results.status = s; results.ok = !!ok; }
+
+  var f = ChessiroSF19.detect();
+  document.getElementById('features').textContent = 'features: ' + JSON.stringify(f) + ' crossOriginIsolated=' + (self.crossOriginIsolated);
+  results.features = f;
+
+  function run() {
+    logEl.textContent = '';
+    results.lines = [];
+    var want = document.getElementById('variant').value;
+    var depth = parseInt(document.getElementById('depth').value, 10) || 12;
+    var pick = ChessiroSF19.select({ baseUrl: '../engines/sf19/' });
+    if (want !== 'auto') { pick.variant = want; pick.url = '../engines/sf19/' + want + '.js'; pick.threads = /-mt/.test(want); }
+    results.variant = pick.variant;
+    log('loading ' + pick.url + ' threads=' + pick.threads + ' maxThreads=' + pick.maxThreads);
+    setStatus('running ' + pick.variant + '...', true);
+
+    var t0 = performance.now();
+    var w = new Worker(pick.url);
+    var phase = 'boot';
+    var gotUciok = false, gotReady = false, bestmove = null, lastInfo = null, stopBestmove = null, stopSentAt = 0;
+    var timer = setTimeout(function () { setStatus('TIMEOUT in phase ' + phase, false); w.terminate(); }, 120000);
+
+    w.onerror = function (e) { log('worker error: ' + (e.message || e)); setStatus('worker error: ' + (e.message || e), false); };
+    w.onmessage = function (e) {
+      var line = String(e.data);
+      if (!/^info depth/.test(line) || /^info depth \d+ seldepth/.test(line) && line.indexOf('currmove') < 0) log(line);
+      if (line === 'uciok') { gotUciok = true; w.postMessage('isready'); }
+      else if (line === 'readyok' && phase === 'boot') {
+        gotReady = true; phase = 'search';
+        results.loadMs = Math.round(performance.now() - t0);
+        log('-- ready after ' + results.loadMs + ' ms; go depth ' + depth);
+        w.postMessage('position startpos moves e2e4 c7c5 g1f3');
+        w.postMessage('go depth ' + depth);
+      }
+      else if (/^info depth \d+ seldepth/.test(line)) lastInfo = line;
+      else if (/^bestmove/.test(line) && phase === 'search') {
+        bestmove = line;
+        var m = /nodes (\d+) nps (\d+) .*time (\d+)/.exec(lastInfo || '');
+        if (m) { results.nodes = +m[1]; results.nps = +m[2]; results.timeMs = +m[3]; }
+        phase = 'infinite';
+        log('-- ' + bestmove + '  nps=' + (results.nps || '?') + '; now go infinite + stop after 800ms');
+        w.postMessage('position fen r1bqkbnr/pp1ppppp/2n5/2p5/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3');
+        w.postMessage('go infinite');
+        setTimeout(function () { stopSentAt = performance.now(); w.postMessage('stop'); }, 800);
+      }
+      else if (/^bestmove/.test(line) && phase === 'infinite') {
+        stopBestmove = line;
+        results.stopLatencyMs = Math.round(performance.now() - stopSentAt);
+        phase = 'errors';
+        log('-- stop honoured in ' + results.stopLatencyMs + ' ms; testing bad input');
+        w.postMessage('position fen not-a-fen');
+        w.postMessage('go depth 3');
+      }
+      else if (/^bestmove/.test(line) && phase === 'errors') {
+        phase = 'done';
+        clearTimeout(timer);
+        var ok = gotUciok && gotReady && bestmove && stopBestmove && line === 'bestmove (none)' && results.stopLatencyMs < 500;
+        setStatus((ok ? 'PASS ' : 'FAIL ') + pick.variant + ' load=' + results.loadMs + 'ms nps=' + results.nps + ' stop=' + results.stopLatencyMs + 'ms', ok);
+        results.done = true;
+        w.postMessage('quit');
+      }
+    };
+    w.postMessage('uci');
+    if (pick.threads && pick.maxThreads > 1) w.postMessage('setoption name Threads value ' + pick.maxThreads);
+  }
+
+  document.getElementById('run').onclick = run;
+  if (/[?&]autorun/.test(location.search)) {
+    var v = /[?&]variant=([^&]+)/.exec(location.search); if (v) document.getElementById('variant').value = v[1];
+    var d = /[?&]depth=(\d+)/.exec(location.search); if (d) document.getElementById('depth').value = d[1];
+    run();
+  }
+}());
+</script>
+</body>
+</html>

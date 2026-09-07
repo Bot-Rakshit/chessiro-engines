@@ -1,0 +1,1193 @@
+From f9cf39fe15b47d08e7f58e827be59e020863da3d Mon Sep 17 00:00:00 2001
+From: Chessiro <chessiro@users.noreply.github.com>
+Date: Mon, 7 Sep 2026 13:34:24 +0530
+Subject: [PATCH 2/2] Chessiro WebAssembly build (single- and multi-threaded)
+
+- chessiro/: em++ Makefile, C++/JS glue, embedded NNUE via wasm .incbin, PGO script
+- Single-threaded flavour: no pthreads, Asyncify yield from check_time so 'stop'
+  works without SharedArrayBuffer
+- Multi-threaded flavour: UCI loop on a proxied pthread fed by a JS command queue
+- Non-fatal handling of malformed position/go commands (browser must not die)
+- Threads option capped, NUMA/log options hidden, elapsed_time >= 1ms
+- Qualified SearchManager::check_time call (direct Asyncify call graph)
+
+No functional change to search or evaluation: bench 2793281
+---
+ src/chessiro/.gitignore  |   3 +
+ src/chessiro/Makefile    | 151 +++++++++++++++++++++++++++++++++
+ src/chessiro/glue.cpp    | 135 ++++++++++++++++++++++++++++++
+ src/chessiro/glue.h      |  45 ++++++++++
+ src/chessiro/nnue_blob.S |  13 +++
+ src/chessiro/pgo.sh      |  30 +++++++
+ src/chessiro/post.js     | 175 +++++++++++++++++++++++++++++++++++++++
+ src/chessiro/pre.js      |  16 ++++
+ src/engine.cpp           |  18 ++++
+ src/main.cpp             |  31 +++++++
+ src/misc.cpp             |   4 +
+ src/nnue/network.cpp     |  11 ++-
+ src/search.cpp           |  33 +++++++-
+ src/thread.cpp           |  58 ++++++++++++-
+ src/thread.h             |   2 +
+ src/timeman.h            |   7 ++
+ src/uci.cpp              |  69 ++++++++++++++-
+ src/uci.h                |  10 +++
+ 18 files changed, 805 insertions(+), 6 deletions(-)
+ create mode 100644 src/chessiro/.gitignore
+ create mode 100644 src/chessiro/Makefile
+ create mode 100644 src/chessiro/glue.cpp
+ create mode 100644 src/chessiro/glue.h
+ create mode 100644 src/chessiro/nnue_blob.S
+ create mode 100755 src/chessiro/pgo.sh
+ create mode 100644 src/chessiro/post.js
+ create mode 100644 src/chessiro/pre.js
+
+diff --git a/src/chessiro/.gitignore b/src/chessiro/.gitignore
+new file mode 100644
+index 00000000..c84f70a9
+--- /dev/null
++++ b/src/chessiro/.gitignore
+@@ -0,0 +1,3 @@
++obj/
++out/
++pgo/
+diff --git a/src/chessiro/Makefile b/src/chessiro/Makefile
+new file mode 100644
+index 00000000..b90b5569
+--- /dev/null
++++ b/src/chessiro/Makefile
+@@ -0,0 +1,151 @@
++# Chessiro WebAssembly build of Stockfish.
++#
++# Usage (from the Stockfish `src` directory):
++#
++#   make -f chessiro/Makefile FLAVOR=st  SIMD=simd      # single-threaded, wasm SIMD
++#   make -f chessiro/Makefile FLAVOR=mt  SIMD=simd      # pthreads, needs SharedArrayBuffer
++#   make -f chessiro/Makefile FLAVOR=st  SIMD=relaxed   # + relaxed-simd dot products
++#   make -f chessiro/Makefile FLAVOR=st  SIMD=nosimd    # scalar fallback for old devices
++#
++# Optional:
++#   PGO=gen | PGO=use PROFILE=path.profdata   profile guided optimisation
++#   OUTDIR=...                                 where to put the .js/.wasm
++#   NAME=...                                   output basename (default sf19-$(FLAVOR)[-$(SIMD)])
++#   DEBUG=1                                    -O1 -g, assertions, no closure
++
++FLAVOR ?= st
++SIMD   ?= simd
++OUTDIR ?= chessiro/out
++PGO    ?=
++DEBUG  ?=
++YIELD_MS ?= 25
++
++ifeq ($(SIMD),simd)
++  NAME ?= sf19-$(FLAVOR)
++else
++  NAME ?= sf19-$(FLAVOR)-$(SIMD)
++endif
++
++CXX = em++
++
++SRCS = attacks.cpp benchmark.cpp bitboard.cpp evaluate.cpp main.cpp \
++	misc.cpp movegen.cpp movepick.cpp position.cpp \
++	search.cpp thread.cpp timeman.cpp tt.cpp uci.cpp ucioption.cpp tune.cpp syzygy/tbprobe.cpp \
++	nnue/nnue_accumulator.cpp nnue/nnue_misc.cpp nnue/network.cpp \
++	nnue/features/p_hm.cpp \
++	engine.cpp score.cpp memory.cpp chessiro/glue.cpp
++
++OBJDIR = chessiro/obj/$(NAME)$(if $(PGO),-pgo$(PGO),)
++OBJS   = $(addprefix $(OBJDIR)/,$(SRCS:.cpp=.o)) $(OBJDIR)/chessiro/nnue_blob.o
++DEPS   = $(filter %.d,$(OBJS:.o=.d))
++
++# Default network name, read from evaluate.h like the upstream Makefile does.
++NNUE_FILE := $(shell grep -E '^\#define EvalFileDefaultName ' evaluate.h | sed -E 's/.*"([^"]+)".*/\1/')
++
++TAG = wasm-$(FLAVOR)$(if $(filter-out simd,$(SIMD)),-$(SIMD),)
++
++# ---------------------------------------------------------------------------
++# Compiler flags
++
++CXXFLAGS = -std=c++17 -Wall -Wcast-qual -fno-exceptions -fno-rtti -I. \
++	-DNDEBUG -DIS_64BIT -DUSE_POPCNT -DNO_PREFETCH -DUSE_SLOPPY_ATOMICS -DNO_TABLEBASES \
++	-DARCH=wasm32 -DCHESSIRO_WASM -DCHESSIRO_EMBED_NNUE -DCHESSIRO_BUILD_TAG=$(TAG) \
++	-DCHESSIRO_YIELD_MS=$(YIELD_MS)
++
++ifeq ($(DEBUG),)
++  CXXFLAGS += -O3 -funroll-loops -flto
++  LDFLAGS_OPT = -O3 -flto --closure 1
++else
++  CXXFLAGS += -O1 -g -UNDEBUG
++  LDFLAGS_OPT = -O1 -g -sASSERTIONS=1
++endif
++
++ifeq ($(SIMD),simd)
++  CXXFLAGS += -msimd128 -msse -msse2 -mssse3 -msse4.1 -DUSE_SSE2 -DUSE_SSSE3 -DUSE_SSE41
++endif
++ifeq ($(SIMD),relaxed)
++  CXXFLAGS += -msimd128 -mrelaxed-simd -msse -msse2 -mssse3 -msse4.1 -DUSE_SSE2 -DUSE_SSSE3 -DUSE_SSE41
++endif
++ifeq ($(SIMD),nosimd)
++  # scalar code paths only
++endif
++
++ifeq ($(FLAVOR),st)
++  CXXFLAGS += -DCHESSIRO_SINGLE_THREADED
++  ifeq ($(NOYIELD),1)
++    CXXFLAGS += -DCHESSIRO_NO_YIELD
++  endif
++  ST_JS = true
++else
++  CXXFLAGS += -pthread
++  ST_JS = false
++endif
++
++ifeq ($(PGO),gen)
++  CXXFLAGS += -fprofile-instr-generate -DCHESSIRO_PGO_GEN
++endif
++ifeq ($(PGO),use)
++  CXXFLAGS += -fprofile-instr-use=$(PROFILE) -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date
++endif
++
++# ---------------------------------------------------------------------------
++# Linker flags
++
++LDFLAGS = $(LDFLAGS_OPT) \
++	-sMODULARIZE=1 -sEXPORT_NAME=ChessiroStockfishFactory \
++	-sENVIRONMENT=web,worker,node \
++	-sEXPORTED_FUNCTIONS=_main,_chessiro_command \
++	-sEXPORTED_RUNTIME_METHODS=ccall \
++	-sINCOMING_MODULE_JS_API=locateFile,print,printErr,instantiateWasm,wasmBinary,mainScriptUrlOrBlob,onAbort,onQuit \
++	-sINITIAL_MEMORY=64MB -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=2GB \
++	-sFILESYSTEM=0 -sEXIT_RUNTIME=0 -sTEXTDECODER=2 \
++	-sMIN_SAFARI_VERSION=160400 \
++	--pre-js chessiro/pre.js \
++	--extern-post-js $(OBJDIR)/post.js
++
++ifeq ($(FLAVOR),st)
++  ifeq ($(NOYIELD),1)
++    LDFLAGS += -sSTACK_SIZE=4MB
++  else
++    LDFLAGS += -sASYNCIFY=1 -sASYNCIFY_IGNORE_INDIRECT=1 -sASYNCIFY_STACK_SIZE=8388608 \
++	-sSTACK_SIZE=4MB
++  endif
++else
++  LDFLAGS += -pthread -sPROXY_TO_PTHREAD=1 -sSTACK_SIZE=3MB \
++	-sPTHREAD_POOL_SIZE=0 -sPTHREAD_POOL_SIZE_STRICT=0 -Wno-pthreads-mem-growth
++endif
++
++ifeq ($(PGO),gen)
++  LDFLAGS += -fprofile-instr-generate -sNODERAWFS=1 -sFILESYSTEM=1 -sEXPORTED_FUNCTIONS=_main,_chessiro_command,_chessiro_flush_profile
++  LDFLAGS_OPT := $(filter-out --closure 1,$(LDFLAGS_OPT))
++endif
++
++# ---------------------------------------------------------------------------
++
++.PHONY: all clean
++
++all: $(OUTDIR)/$(NAME).js
++
++$(OUTDIR)/$(NAME).js: $(OBJS) $(OBJDIR)/post.js chessiro/pre.js | $(OUTDIR)
++	$(CXX) $(CXXFLAGS) $(LDFLAGS) $(OBJS) -o $@
++	@ls -la $(OUTDIR)/$(NAME).js $(OUTDIR)/$(NAME).wasm
++
++$(OBJDIR)/post.js: chessiro/post.js | $(OBJDIR)
++	sed -e 's/CHESSIRO_FACTORY/ChessiroStockfishFactory/g' -e 's/CHESSIRO_SINGLE_THREADED_JS/$(ST_JS)/g' $< > $@
++
++$(OBJDIR)/%.o: %.cpp | $(OBJDIR)
++	@mkdir -p $(dir $@)
++	$(CXX) $(CXXFLAGS) -MMD -MP -c $< -o $@
++
++# The network blob is assembled without LTO so that the symbol types survive.
++$(OBJDIR)/chessiro/nnue_blob.o: chessiro/nnue_blob.S $(NNUE_FILE) | $(OBJDIR)
++	@mkdir -p $(dir $@)
++	$(CXX) -DCHESSIRO_NNUE_FILE='"$(NNUE_FILE)"' -c $< -o $@
++
++$(OBJDIR) $(OUTDIR):
++	mkdir -p $@
++
++clean:
++	rm -rf chessiro/obj $(OUTDIR)
++
++-include $(DEPS)
+diff --git a/src/chessiro/glue.cpp b/src/chessiro/glue.cpp
+new file mode 100644
+index 00000000..e3b76f4f
+--- /dev/null
++++ b/src/chessiro/glue.cpp
+@@ -0,0 +1,135 @@
++/*
++  Chessiro WebAssembly glue for Stockfish.
++
++  This file is part of the Chessiro build of Stockfish and is licensed under
++  the GNU General Public License v3, like Stockfish itself.
++
++  Two flavours are produced from the same sources:
++
++  * Multi-threaded (pthreads / SharedArrayBuffer). main() runs the regular UCI
++    loop on its own pthread (PROXY_TO_PTHREAD) and blocks on a command queue
++    that JS fills from the Worker's onmessage handler. Search threads are
++    ordinary pthreads, exactly like the native engine.
++
++  * Single-threaded (no SharedArrayBuffer needed). There are no threads at all.
++    JS calls chessiro_command() for each UCI line; 'go' runs the whole search
++    synchronously on the Worker's thread, periodically suspending via Asyncify
++    (chessiro_yield) so that the event loop can deliver 'stop'.
++*/
++
++#include "glue.h"
++
++#include <cstdlib>
++#include <string>
++
++#include <emscripten.h>
++
++#include "../uci.h"
++
++using namespace Stockfish;
++
++extern UCIEngine* chessiro_uci;  // main.cpp
++
++#ifdef CHESSIRO_PGO_GEN
++// Instrumented builds: let JS dump the raw profile before the process exits.
++extern "C" int __llvm_profile_write_file(void);
++extern "C" EMSCRIPTEN_KEEPALIVE int chessiro_flush_profile() { return __llvm_profile_write_file(); }
++#endif
++
++#ifdef CHESSIRO_SINGLE_THREADED
++
++// Yield implementation.
++//
++// Browsers: a MessageChannel round trip. Unlike setTimeout(0), which browsers
++// clamp to >= 1ms (4ms once nested), it costs microseconds, and it shares the
++// "posted message" task source with the parent's Worker.postMessage(), so a
++// pending 'stop' is guaranteed to run before we resume.
++//
++// Node: setImmediate. Node drains same-thread MessagePort queues in a loop
++// without returning to the event loop, which would starve stdin and timers.
++// clang-format off
++#ifndef CHESSIRO_NO_YIELD
++EM_ASYNC_JS(void, chessiro_yield, (), {
++    await new Promise(function(resolve) {
++        if (typeof setImmediate === "function" && typeof process === "object" && process["versions"] && process["versions"]["node"]) {
++            setImmediate(resolve);
++        } else if (typeof MessageChannel === "function") {
++            var ch = Module["$yieldChannel"];
++            if (!ch) {
++                ch = Module["$yieldChannel"] = new MessageChannel();
++                ch.port1.onmessage = function() {
++                    var r = Module["$yieldResolve"];
++                    Module["$yieldResolve"] = null;
++                    if (r) r();
++                };
++            }
++            Module["$yieldResolve"] = resolve;
++            ch.port2.postMessage(0);
++        } else {
++            setTimeout(resolve, 0);
++        }
++    });
++});
++#endif
++// clang-format on
++
++std::string chessiro_getline() { return "quit"; }  // never used in this flavour
++void        chessiro_notify_quit() {}
++
++extern "C" EMSCRIPTEN_KEEPALIVE void chessiro_command(const char* utf8) {
++    if (chessiro_uci && utf8)
++        chessiro_uci->process_command(std::string(utf8));
++}
++
++#else  // multi-threaded
++
++    #include <condition_variable>
++    #include <mutex>
++    #include <queue>
++
++namespace {
++
++struct CommandQueue {
++    std::mutex              m;
++    std::condition_variable cv;
++    std::queue<std::string> q;
++
++    void push(std::string s) {
++        {
++            std::lock_guard<std::mutex> lk(m);
++            q.push(std::move(s));
++        }
++        cv.notify_one();
++    }
++
++    std::string pop() {
++        std::unique_lock<std::mutex> lk(m);
++        cv.wait(lk, [&] { return !q.empty(); });
++        std::string s = std::move(q.front());
++        q.pop();
++        return s;
++    }
++};
++
++CommandQueue inQ;
++
++}  // namespace
++
++std::string chessiro_getline() { return inQ.pop(); }
++
++void chessiro_notify_quit() {
++    // clang-format off
++    MAIN_THREAD_ASYNC_EM_ASM({
++        if (Module["onQuit"]) Module["onQuit"]();
++    });
++    // clang-format on
++}
++
++// Called on the JS side's thread (the Worker's main thread). Only touches the
++// queue, so it never blocks for long even though that thread cannot Atomics.wait.
++extern "C" EMSCRIPTEN_KEEPALIVE void chessiro_command(const char* utf8) {
++    if (utf8)
++        inQ.push(std::string(utf8));
++}
++
++#endif
+diff --git a/src/chessiro/glue.h b/src/chessiro/glue.h
+new file mode 100644
+index 00000000..2fb78aa8
+--- /dev/null
++++ b/src/chessiro/glue.h
+@@ -0,0 +1,45 @@
++/*
++  Chessiro WebAssembly glue for Stockfish.
++
++  This file is part of the Chessiro build of Stockfish and is licensed under
++  the GNU General Public License v3, like Stockfish itself.
++*/
++
++#ifndef CHESSIRO_GLUE_H_INCLUDED
++#define CHESSIRO_GLUE_H_INCLUDED
++
++#include <string>
++
++#ifndef CHESSIRO_YIELD_MS
++    // Wall-clock interval between yields to the JS event loop (single-threaded
++    // build only). This bounds the latency of 'stop'.
++    #define CHESSIRO_YIELD_MS 25
++#endif
++
++#ifndef CHESSIRO_MAX_THREADS
++    #define CHESSIRO_MAX_THREADS 64
++#endif
++
++// Blocks until the JS side pushes a command (multi-threaded build).
++std::string chessiro_getline();
++
++extern "C" {
++
++#if defined(CHESSIRO_SINGLE_THREADED) && defined(CHESSIRO_NO_YIELD)
++// Measurement-only build: no Asyncify, 'stop' cannot interrupt a search.
++inline void chessiro_yield() {}
++#elif defined(CHESSIRO_SINGLE_THREADED)
++// Suspends the wasm (Asyncify) until the JS event loop has had a turn.
++// Defined with EM_ASYNC_JS in glue.cpp; the import attribute must match it.
++__attribute__((import_module("env"), import_name("__asyncjs__chessiro_yield"))) void
++chessiro_yield();
++#endif
++
++// Entry point used by JS for every UCI line.
++void chessiro_command(const char* utf8);
++}
++
++// Multi-threaded build: called once the UCI loop has exited after 'quit'.
++void chessiro_notify_quit();
++
++#endif  // CHESSIRO_GLUE_H_INCLUDED
+diff --git a/src/chessiro/nnue_blob.S b/src/chessiro/nnue_blob.S
+new file mode 100644
+index 00000000..3c7045c2
+--- /dev/null
++++ b/src/chessiro/nnue_blob.S
+@@ -0,0 +1,13 @@
++// Embeds the default NNUE file into a read-only wasm data segment.
++// Assembled separately (no LTO) with -DCHESSIRO_NNUE_FILE="nn-....nnue".
++    .section .rodata.gEmbeddedNNUEData,"",@
++    .globl gEmbeddedNNUEData
++    .type gEmbeddedNNUEData,@object
++    .globl gEmbeddedNNUEEnd
++    .type gEmbeddedNNUEEnd,@object
++    .p2align 6
++gEmbeddedNNUEData:
++    .incbin CHESSIRO_NNUE_FILE
++gEmbeddedNNUEEnd:
++    .size gEmbeddedNNUEData, gEmbeddedNNUEEnd - gEmbeddedNNUEData
++    .size gEmbeddedNNUEEnd, 0
+diff --git a/src/chessiro/pgo.sh b/src/chessiro/pgo.sh
+new file mode 100755
+index 00000000..58fc33fd
+--- /dev/null
++++ b/src/chessiro/pgo.sh
+@@ -0,0 +1,30 @@
++#!/usr/bin/env bash
++# Profile-guided build of one variant.
++#   chessiro/pgo.sh FLAVOR SIMD [extra make args]
++# 1. build instrumented, 2. run `bench` under node to collect a profile,
++# 3. rebuild with the profile.
++set -euo pipefail
++FLAVOR=${1:-st}; SIMD=${2:-simd}; shift 2 || true
++cd "$(dirname "$0")/.."
++
++NAME=sf19-$FLAVOR; [ "$SIMD" != simd ] && NAME=$NAME-$SIMD
++GEN_DIR=chessiro/pgo/$NAME
++mkdir -p "$GEN_DIR"
++rm -f "$GEN_DIR"/*.profraw "$GEN_DIR"/*.profdata
++
++echo "== [$NAME] instrumented build"
++make -f chessiro/Makefile FLAVOR=$FLAVOR SIMD=$SIMD PGO=gen OUTDIR=$GEN_DIR NAME=$NAME "$@" >/dev/null
++
++echo "== [$NAME] collecting profile (bench)"
++for run in 1 2; do
++  ( cd "$GEN_DIR" && LLVM_PROFILE_FILE="bench-$run.profraw" \
++      bash -c 'printf "setoption name Threads value 1\nbench\nbench 16 1 14 current depth mixed\n" | node '"$NAME"'.js 2>&1' \
++      | grep -E "Nodes searched|Nodes/second" || true )
++done
++ls -la "$GEN_DIR"/*.profraw
++
++LLVM_ROOT=$(em-config LLVM_ROOT)
++"$LLVM_ROOT/llvm-profdata" merge -output="$GEN_DIR/merged.profdata" "$GEN_DIR"/*.profraw
++
++echo "== [$NAME] optimised build with profile"
++make -f chessiro/Makefile FLAVOR=$FLAVOR SIMD=$SIMD PGO=use PROFILE=$PWD/$GEN_DIR/merged.profdata NAME=$NAME "$@"
+diff --git a/src/chessiro/post.js b/src/chessiro/post.js
+new file mode 100644
+index 00000000..083aadcb
+--- /dev/null
++++ b/src/chessiro/post.js
+@@ -0,0 +1,175 @@
++// --extern-post-js: appended after the emscripten module factory (outside it).
++//
++// Turns the module into a drop-in UCI Worker:
++//
++//     const engine = new Worker("sf19-st.js");
++//     engine.onmessage = (e) => console.log(e.data);   // one UCI line per message
++//     engine.postMessage("uci");
++//
++// Also usable as a Node CLI (`node sf19-st.js`) or as a module
++// (`require("./sf19-st.js")` returns the emscripten factory).
++//
++// The factory name is injected at build time via -sEXPORT_NAME=CHESSIRO_FACTORY.
++
++(function () {
++    "use strict";
++
++    var factory = CHESSIRO_FACTORY;
++    var isNode = typeof process === "object" && !!(process.versions && process.versions.node)
++        && !(typeof window !== "undefined" && typeof window.document !== "undefined");
++
++    // emscripten re-loads this very script inside every pthread Web Worker; the
++    // module factory has already been invoked for those (see the generated code
++    // above). Nothing else must run there.
++    var isPthread = typeof self !== "undefined" && self.name && String(self.name).indexOf("em-pthread") === 0;
++    if (isNode) {
++        try { isPthread = require("node:worker_threads").workerData === "em-pthread"; } catch (e) {}
++    }
++    if (isPthread) return;
++
++    var isWebWorker = !isNode && typeof self !== "undefined" && typeof importScripts === "function"
++        && typeof WorkerGlobalScope !== "undefined";
++
++    // Commands that are safe to deliver while a search is running. Everything
++    // else is queued until the engine prints 'bestmove' (like a well-behaved GUI).
++    var PASSTHROUGH = /^(stop|ponderhit|isready|quit|uci|d)\b/;
++
++    function createEngine(opts) {
++        var Module = {
++            locateFile: opts.locateFile,
++            listener: function (line) {
++                if (/^bestmove\b/.test(line)) onSearchDone();
++                opts.onLine(line);
++            }
++        };
++        if (opts.instantiateWasm) Module.instantiateWasm = opts.instantiateWasm;
++        if (opts.wasmBinary) Module.wasmBinary = opts.wasmBinary;
++
++        var instance = null;
++        var ready = false;
++        var searching = false;     // a 'go' is in flight (cleared by the 'bestmove' line)
++        var inflight = false;      // single-threaded: an async call has not returned yet
++        var startup = [];          // commands received before the module was ready
++        var queue = [];            // commands deferred while busy
++        var singleThreaded = false;
++
++        function isBusy() { return searching || inflight; }
++
++        function send(cmd) {
++            var isGo = /^go\b/.test(cmd) && !/^go\s+perft\b/.test(cmd);
++            var isLong = isGo || /^(bench|speedtest)\b/.test(cmd);
++            if (isGo) searching = true;
++            if (singleThreaded && isLong) {
++                // The whole search runs inside this call, yielding to the event
++                // loop periodically; the promise resolves when it returns.
++                inflight = true;
++                instance.ccall("chessiro_command", null, ["string"], [cmd], { async: true })
++                    .then(function () { inflight = false; searching = false; onIdle(); },
++                          function (e) {
++                              inflight = false; searching = false;
++                              opts.onLine("info string ERROR: " + (e && e.message ? e.message : e));
++                              onIdle();
++                          });
++            } else {
++                instance.ccall("chessiro_command", null, ["string"], [cmd]);
++            }
++            if (cmd === "quit") {
++                // Single-threaded: the call above already processed it. Multi-threaded:
++                // the UCI thread still has to drain the queue; it calls Module.onQuit
++                // when done (with a safety timeout).
++                if (singleThreaded) finishQuit();
++                else quitTimer = setTimeout(finishQuit, 10000);
++            }
++        }
++
++        var quitTimer = null, quitDone = false;
++        function finishQuit() {
++            if (quitDone) return;
++            quitDone = true;
++            if (quitTimer) clearTimeout(quitTimer);
++            if (typeof instance["_chessiro_flush_profile"] === "function") instance["_chessiro_flush_profile"]();
++            try { instance.terminate(); } catch (e) {}
++            if (opts.onQuit) opts.onQuit();
++        }
++        Module["onQuit"] = function () { finishQuit(); };
++
++        function flush() {
++            while (queue.length && !isBusy()) send(queue.shift());
++        }
++
++        function onIdle() {
++            // Defer so that the 'bestmove' line is delivered before queued commands run.
++            setTimeout(flush, 0);
++        }
++
++        function onSearchDone() {
++            if (!searching) return;
++            searching = false;
++            if (!inflight) onIdle();
++        }
++
++        function processCommand(cmd) {
++            cmd = String(cmd).trim();
++            if (!cmd) return;
++            if (!ready) { startup.push(cmd); return; }
++            if (isBusy() && !PASSTHROUGH.test(cmd)) {
++                queue.push(cmd);
++                return;
++            }
++            send(cmd);
++        }
++
++        factory(Module).then(function (m) {
++            instance = m;
++            singleThreaded = typeof m["_chessiro_yield"] !== "undefined" || !!m["$singleThreaded"] || opts.singleThreaded;
++            ready = true;
++            var pending = startup; startup = [];
++            pending.forEach(processCommand);
++        }).catch(function (e) {
++            opts.onLine("info string ERROR: engine failed to load: " + (e && e.message ? e.message : e));
++            setTimeout(function () { throw e; }, 0);
++        });
++
++        return { postMessage: processCommand, isBusy: function () { return isBusy() || !ready || queue.length > 0; } };
++    }
++
++    if (isWebWorker) {
++        var wasmUrl = self.location.href.replace(/\.js(\?.*)?(#.*)?$/, ".wasm");
++        var engine = createEngine({
++            singleThreaded: CHESSIRO_SINGLE_THREADED_JS,
++            locateFile: function (path) {
++                return /\.wasm$/.test(path) ? wasmUrl : path;
++            },
++            onLine: function (line) { postMessage(line); },
++            onQuit: function () { try { self.close(); } catch (e) {} }
++        });
++        self.onmessage = function (event) {
++            engine.postMessage(event.data);
++        };
++    } else if (isNode && typeof require === "function" && require.main === module) {
++        var path = require("path");
++        var readline = require("readline");
++        var wasmPath = path.join(__dirname, path.basename(__filename, ".js") + ".wasm");
++        var eng = createEngine({
++            singleThreaded: CHESSIRO_SINGLE_THREADED_JS,
++            locateFile: function (p) { return /\.wasm$/.test(p) ? wasmPath : p; },
++            onLine: function (line) { process.stdout.write(line + "\n"); },
++            onQuit: function () { setTimeout(function () { process.exit(0); }, 10); }
++        });
++        readline.createInterface({ input: process.stdin, terminal: false })
++            .on("line", function (line) { eng.postMessage(line); })
++            .on("close", function () {
++                // stdin closed (e.g. piped input): finish outstanding work, then quit.
++                (function waitIdle() {
++                    if (eng.isBusy()) return setTimeout(waitIdle, 20);
++                    eng.postMessage("quit");
++                }());
++            });
++    } else if (isNode) {
++        module.exports = factory;
++        module.exports.createEngine = createEngine;
++    } else if (typeof self !== "undefined") {
++        // Main browser thread: expose factory + helper without clobbering globals.
++        self["ChessiroStockfish"] = { factory: factory, createEngine: createEngine };
++    }
++}());
+diff --git a/src/chessiro/pre.js b/src/chessiro/pre.js
+new file mode 100644
+index 00000000..a74dd6ce
+--- /dev/null
++++ b/src/chessiro/pre.js
+@@ -0,0 +1,16 @@
++// --pre-js: runs inside the emscripten module factory, before the runtime.
++// Route engine output through Module.listener when the host provides one.
++
++Module["print"] = function (line) {
++    if (Module["listener"]) Module["listener"](line);
++    else console.log(line);
++};
++Module["printErr"] = function (line) {
++    if (Module["listener"]) Module["listener"](line);
++    else console.error(line);
++};
++Module["terminate"] = function () {
++    if (typeof PThread !== "undefined" && PThread["terminateAllThreads"]) {
++        PThread["terminateAllThreads"]();
++    }
++};
+diff --git a/src/engine.cpp b/src/engine.cpp
+index 3179efa4..9b4f36cc 100644
+--- a/src/engine.cpp
++++ b/src/engine.cpp
+@@ -44,6 +44,10 @@
+ #include "uci.h"
+ #include "ucioption.h"
+ 
++#ifdef CHESSIRO_WASM
++    #include "chessiro/glue.h"
++#endif
++
+ namespace Stockfish {
+ 
+ namespace NN = Eval::NNUE;
+@@ -66,6 +70,7 @@ Engine::Engine(std::optional<std::filesystem::path> path) :
+ 
+     pos.set(StartFEN, false, &states->back());
+ 
++#ifndef CHESSIRO_WASM
+     options.add(  //
+       "Debug Log File", Option("", [](const Option& o) {
+           start_logger(path_from_utf8(std::string(o)));
+@@ -79,12 +84,25 @@ Engine::Engine(std::optional<std::filesystem::path> path) :
+           return numa_config_information_as_string() + "\n"
+                + thread_allocation_information_as_string();
+       }));
++#endif
+ 
++#if defined(CHESSIRO_SINGLE_THREADED)
++    // No pthreads in this build: the option exists for GUI compatibility only.
++    options.add("Threads", Option(1, 1, 1, [](const Option&) { return std::nullopt; }));
++#elif defined(CHESSIRO_WASM)
++    // Every search thread is a Web Worker; keep the ceiling sane for browsers.
++    options.add(  //
++      "Threads", Option(1, 1, CHESSIRO_MAX_THREADS, [this](const Option&) {
++          resize_threads();
++          return std::nullopt;
++      }));
++#else
+     options.add(  //
+       "Threads", Option(1, 1, MaxThreads, [this](const Option&) {
+           resize_threads();
+           return thread_allocation_information_as_string();
+       }));
++#endif
+ 
+     options.add(  //
+       "Hash", Option(16, 1, MaxHashMB, [this](const Option& o) {
+diff --git a/src/main.cpp b/src/main.cpp
+index 304b2be0..e58bfe70 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -26,6 +26,10 @@
+ #include "tune.h"
+ #include "uci.h"
+ 
++#ifdef CHESSIRO_WASM
++    #include "chessiro/glue.h"
++#endif
++
+ using namespace Stockfish;
+ 
+ #ifdef UNIVERSAL_BINARY
+@@ -36,12 +40,38 @@ int main(int argc, char* argv[]);  // silence 'no previous declaration'
+ __attribute__((used)) // keep main alive
+ #endif
+ 
++#ifdef CHESSIRO_WASM
++// The UCI front end is owned by a global so that the JS glue can reach it
++// (single-threaded builds drive it one command at a time from JS).
++UCIEngine* chessiro_uci = nullptr;
++#endif
++
+ int main(int argc, char* argv[]) {
+     std::cout << engine_info() << std::endl;
+ 
+     Attacks::init();
+     Position::init();
+ 
++#ifdef CHESSIRO_WASM
++    // argv is not meaningful inside a browser; never treat it as one-shot commands.
++    auto cli     = CommandLine(0, nullptr);
++    chessiro_uci = new UCIEngine(std::move(cli));
++
++    Tune::init(chessiro_uci->engine_options());
++
++    #ifdef CHESSIRO_SINGLE_THREADED
++    // Nothing else to do: JS calls chessiro_command() for every UCI line.
++    return 0;
++    #else
++    // Multi-threaded build: main() runs on its own pthread (PROXY_TO_PTHREAD) and
++    // blocks in the normal UCI loop, fed by the JS command queue.
++    chessiro_uci->loop();
++    delete chessiro_uci;
++    chessiro_uci = nullptr;
++    chessiro_notify_quit();  // tell JS that every queued command has been processed
++    return 0;
++    #endif
++#else
+     auto cli = CommandLine(argc, argv);
+     auto uci = std::make_unique<UCIEngine>(std::move(cli));
+ 
+@@ -50,6 +80,7 @@ int main(int argc, char* argv[]) {
+     uci->loop();
+ 
+     return 0;
++#endif
+ }
+ 
+ #ifdef UNIVERSAL_BINARY
+diff --git a/src/misc.cpp b/src/misc.cpp
+index b05e8e8c..f717372f 100644
+--- a/src/misc.cpp
++++ b/src/misc.cpp
+@@ -171,6 +171,10 @@ std::string engine_version_info() {
+ #endif
+     }
+ 
++#ifdef CHESSIRO_BUILD_TAG
++    ss << " " << stringify(CHESSIRO_BUILD_TAG);
++#endif
++
+     return ss.str();
+ }
+ 
+diff --git a/src/nnue/network.cpp b/src/nnue/network.cpp
+index e6f166d4..d2d99883 100644
+--- a/src/nnue/network.cpp
++++ b/src/nnue/network.cpp
+@@ -46,7 +46,16 @@
+ //     const unsigned char *const gEmbeddedNNUEEnd;     // a marker to the end
+ //     const unsigned int         gEmbeddedNNUESize;    // the size of the embedded file
+ // Note that this does not work in Microsoft Visual Studio.
+-#if !defined(UNIVERSAL_BINARY) && !defined(_MSC_VER) && !defined(NNUE_EMBEDDING_OFF)
++#if defined(CHESSIRO_EMBED_NNUE)
++// incbin.h emits ELF-style section directives that the WebAssembly assembler
++// rejects. The network is instead assembled into a read-only data segment by
++// chessiro/nnue_blob.S, so a single .wasm ships the whole engine and no
++// fetch()/FS is needed at runtime.
++extern "C" const unsigned char gEmbeddedNNUEData[];
++extern "C" const unsigned char gEmbeddedNNUEEnd[];
++static const unsigned int      gEmbeddedNNUESize =
++  static_cast<unsigned int>(gEmbeddedNNUEEnd - gEmbeddedNNUEData);
++#elif !defined(UNIVERSAL_BINARY) && !defined(_MSC_VER) && !defined(NNUE_EMBEDDING_OFF)
+ INCBIN(EmbeddedNNUE, EvalFileDefaultName);
+ #elif defined(UNIVERSAL_BINARY_MACOS_X86_SLICE)
+ // Determined at runtime, see universal/nnue_embed.cpp
+diff --git a/src/search.cpp b/src/search.cpp
+index cf4a7770..9ead93bb 100644
+--- a/src/search.cpp
++++ b/src/search.cpp
+@@ -50,6 +50,12 @@
+ #include "uci.h"
+ #include "ucioption.h"
+ 
++#ifdef CHESSIRO_WASM
++    #include <chrono>
++    #include <thread>
++    #include "chessiro/glue.h"
++#endif
++
+ namespace Stockfish {
+ 
+ static constexpr std::array<int, 16> lmrDivisor = {3637, 2787, 2761, 2939, 3171, 3347, 3147, 2762,
+@@ -222,7 +228,13 @@ void Search::Worker::start_searching() {
+     // GUI sends a "stop" or "ponderhit" command. We therefore simply wait here
+     // until the GUI sends one of those commands.
+     while (!threads.stop && (main_manager()->ponder || limits.infinite))
+-    {}
++    {
++#if defined(CHESSIRO_SINGLE_THREADED)
++        chessiro_yield();  // let the JS event loop deliver 'stop' / 'ponderhit'
++#elif defined(CHESSIRO_WASM)
++        std::this_thread::sleep_for(std::chrono::milliseconds(1));  // don't burn a core
++#endif
++    }
+ 
+     // Stop the threads if not already stopped (also raise the stop if "ponderhit"
+     // just reset threads.ponder).
+@@ -774,8 +786,10 @@ Value Search::Worker::search(
+                         && (ss - 1)->currentMove == lastIterationIdxPV[ss->ply - 1]));
+ 
+     // Check for the available remaining time
++    // Qualified call: main_manager() is known to be a SearchManager, so skip the
++    // virtual dispatch (also keeps the Asyncify call graph direct in wasm builds).
+     if (is_mainthread())
+-        main_manager()->check_time(*this);
++        main_manager()->SearchManager::check_time(*this);
+ 
+     // Used to send selDepth info to GUI (selDepth counts from 1, ply from 0)
+     if (PvNode && selDepth < ss->ply + 1)
+@@ -2112,6 +2126,21 @@ void SearchManager::check_time(Search::Worker& worker) {
+     TimePoint elapsed = tm.elapsed([&worker]() { return worker.threads.nodes_searched(); });
+     TimePoint tick    = worker.limits.startTime + elapsed;
+ 
++#ifdef CHESSIRO_SINGLE_THREADED
++    // Single-threaded WASM: the search runs on the Worker's only thread, so the
++    // JS event loop is blocked. Yield every ~CHESSIRO_YIELD_MS of wall-clock
++    // time so queued messages (notably 'stop') are processed.
++    {
++        static TimePoint lastYieldTick = 0;
++        TimePoint        wall          = now();
++        if (wall - lastYieldTick >= CHESSIRO_YIELD_MS)
++        {
++            lastYieldTick = wall;
++            chessiro_yield();
++        }
++    }
++#endif
++
+     if (tick - lastInfoTime >= 1000)
+     {
+         lastInfoTime = tick;
+diff --git a/src/thread.cpp b/src/thread.cpp
+index d7672681..96523da0 100644
+--- a/src/thread.cpp
++++ b/src/thread.cpp
+@@ -46,6 +46,53 @@ namespace Stockfish {
+ 
+ // Constructor launches the thread and waits until it goes to sleep
+ // in idle_loop(). Note that 'searching' and 'exit' should be already set.
++#ifdef CHESSIRO_SINGLE_THREADED
++
++// Single-threaded WebAssembly build: there are no native threads at all. Every
++// "job" runs synchronously on the caller (the JS event loop of the Worker), and
++// the search yields to JS periodically from check_time() via Asyncify so that
++// 'stop' can still be delivered mid-search.
++
++Thread::Thread(Search::SharedState&                    sharedState,
++               std::unique_ptr<Search::ISearchManager> sm,
++               usize                                   n,
++               usize                                   numaN,
++               usize                                   totalNumaCount,
++               OptionalThreadToNumaNodeBinder          binder) :
++    idx(n),
++    idxInNuma(numaN),
++    totalNuma(totalNumaCount),
++    nthreads(sharedState.options["Threads"]) {
++
++    searching             = false;
++    this->numaAccessToken = binder();
++    this->worker          = make_unique_large_page<Search::Worker>(
++      sharedState, std::move(sm), n, idxInNuma, totalNuma, this->numaAccessToken);
++}
++
++Thread::~Thread() {}
++
++void Thread::start_searching() {
++    assert(worker != nullptr);
++    worker->start_searching();
++}
++
++void Thread::clear_worker() {
++    assert(worker != nullptr);
++    worker->clear();
++}
++
++void Thread::wait_for_search_finished() {}
++
++void Thread::run_custom_job(std::function<void()> f) {
++    if (f)
++        f();
++}
++
++void Thread::idle_loop() {}
++
++#else
++
+ Thread::Thread(Search::SharedState&                    sharedState,
+                std::unique_ptr<Search::ISearchManager> sm,
+                usize                                   n,
+@@ -121,8 +168,6 @@ void Thread::run_custom_job(std::function<void()> f) {
+     cv.notify_one();
+ }
+ 
+-void Thread::ensure_network_replicated() { worker->ensure_network_replicated(); }
+-
+ // Thread gets parked here, blocked on the condition variable
+ // when the thread has no work to do.
+ 
+@@ -147,6 +192,10 @@ void Thread::idle_loop() {
+     }
+ }
+ 
++#endif  // CHESSIRO_SINGLE_THREADED
++
++void Thread::ensure_network_replicated() { worker->ensure_network_replicated(); }
++
+ Search::SearchManager* ThreadPool::main_manager() { return main_thread()->worker->main_manager(); }
+ 
+ u64 ThreadPool::nodes_searched() const { return accumulate(&Search::Worker::nodes); }
+@@ -180,6 +229,10 @@ void ThreadPool::set(const NumaConfig&                           numaConfig,
+         // This is undesirable, and so the default behaviour (i.e. when the user does not
+         // change the NumaConfig UCI setting) is to not bind the threads to processors
+         // unless we know for sure that we span NUMA nodes and replication is required.
++#ifdef CHESSIRO_WASM
++        // No NUMA in a browser; the option is not even exposed.
++        const bool doBindThreads = false;
++#else
+         const std::string numaPolicy(sharedState.options["NumaPolicy"]);
+         const bool        doBindThreads = [&]() {
+             if (numaPolicy == "none")
+@@ -191,6 +244,7 @@ void ThreadPool::set(const NumaConfig&                           numaConfig,
+             // numaPolicy == "system", or explicitly set by the user
+             return true;
+         }();
++#endif
+ 
+         std::map<NumaIndex, usize> counts;
+         boundThreadToNumaNode = doBindThreads
+diff --git a/src/thread.h b/src/thread.h
+index 111659c7..f17853c3 100644
+--- a/src/thread.h
++++ b/src/thread.h
+@@ -103,7 +103,9 @@ class Thread {
+     std::condition_variable   cv;
+     usize                     idx, idxInNuma, totalNuma, nthreads;
+     bool                      exit = false, searching = true;  // Set before starting std::thread
++#ifndef CHESSIRO_SINGLE_THREADED
+     NativeThread              stdThread;
++#endif
+     NumaReplicatedAccessToken numaAccessToken;
+ };
+ 
+diff --git a/src/timeman.h b/src/timeman.h
+index 437f6bbc..4493b7f7 100644
+--- a/src/timeman.h
++++ b/src/timeman.h
+@@ -20,6 +20,7 @@
+ #define TIMEMAN_H_INCLUDED
+ 
+ 
++#include <algorithm>
+ #include <limits>
+ 
+ #include "misc.h"
+@@ -49,7 +50,13 @@ class TimeManagement {
+     TimePoint elapsed(FUNC nodes) const {
+         return useNodesTime ? TimePoint(nodes()) : elapsed_time();
+     }
++#ifdef CHESSIRO_WASM
++    // performance.now() can be coarse/clamped in browsers; never report 0 ms
++    // (avoids a division by zero in the nps calculation).
++    TimePoint elapsed_time() const { return std::max(now() - startTime, TimePoint(1)); };
++#else
+     TimePoint elapsed_time() const { return now() - startTime; };
++#endif
+ 
+     void clear();
+     void advance_nodes_time(i64 nodes);
+diff --git a/src/uci.cpp b/src/uci.cpp
+index 5dd2d038..adabe923 100644
+--- a/src/uci.cpp
++++ b/src/uci.cpp
+@@ -42,6 +42,10 @@
+ #include "types.h"
+ #include "ucioption.h"
+ 
++#ifdef CHESSIRO_WASM
++    #include "chessiro/glue.h"
++#endif
++
+ namespace Stockfish {
+ 
+ using Time = std::chrono::steady_clock;
+@@ -100,10 +104,27 @@ void UCIEngine::loop() {
+ 
+     do
+     {
++#ifdef CHESSIRO_WASM
++        cmd = chessiro_getline();  // Blocks on the JS command queue (see chessiro/glue.cpp)
++#else
+         if (cli.argc == 1
+             && !getline(std::cin, cmd))  // Wait for an input or an end-of-file (EOF) indication
+             cmd = "quit";
++#endif
++
++        token = process_command(cmd);
++
++#ifdef CHESSIRO_WASM
++    } while (token != "quit");
++#else
++    } while (token != "quit" && cli.argc == 1);  // The command-line arguments are one-shot
++#endif
++}
+ 
++// Processes a single UCI command and returns the first token of the command.
++std::string UCIEngine::process_command(const std::string& cmd) {
++    std::string token;
++    {
+         currentCmd = cmd;
+         std::istringstream is(cmd);
+ 
+@@ -132,9 +153,21 @@ void UCIEngine::loop() {
+             setoption(is);
+         else if (token == "go")
+         {
++#ifdef CHESSIRO_WASM
++            // A previous 'position' command failed. Refuse to search the stale
++            // position; tell the GUI there is no move instead of terminating.
++            if (!positionOk)
++            {
++                sync_cout << "info string ERROR: no valid position set, ignoring 'go'"
++                          << sync_endl;
++                sync_cout << "bestmove (none)" << sync_endl;
++                return token;
++            }
++#else
+             // send info strings after the go command is sent for old GUIs and python-chess
+             print_info_string(engine.numa_config_information_as_string());
+             print_info_string(engine.thread_allocation_information_as_string());
++#endif
+             go(is);
+         }
+         else if (token == "position")
+@@ -184,8 +217,9 @@ void UCIEngine::loop() {
+         else if (!token.empty() && token[0] != '#')
+             sync_cout << "Unknown command: '" << cmd << "'. Type help for more information."
+                       << sync_endl;
++    }
+ 
+-    } while (token != "quit" && cli.argc <= 1);  // The command-line arguments are one-shot
++    return token;
+ }
+ 
+ Search::LimitsType UCIEngine::parse_limits(std::istream& is) {
+@@ -229,7 +263,16 @@ Search::LimitsType UCIEngine::parse_limits(std::istream& is) {
+             limits.ponderMode = true;
+ 
+         if (is.fail())
++        {
++#ifdef CHESSIRO_WASM
++            sync_cout << "info string ERROR: Invalid argument for '" << token << "' in `"
++                      << currentCmd << "`" << sync_endl;
++            limitsOk = false;
++            break;
++#else
+             terminate_on_critical_error("Invalid argument for '" + token + "'");
++#endif
++        }
+     }
+ 
+     return limits;
+@@ -237,7 +280,15 @@ Search::LimitsType UCIEngine::parse_limits(std::istream& is) {
+ 
+ void UCIEngine::go(std::istringstream& is) {
+ 
++    limitsOk                  = true;
+     Search::LimitsType limits = parse_limits(is);
++#ifdef CHESSIRO_WASM
++    if (!limitsOk)
++    {
++        sync_cout << "bestmove (none)" << sync_endl;
++        return;
++    }
++#endif
+ 
+     if (limits.perft)
+         perft(limits);
+@@ -523,8 +574,18 @@ void UCIEngine::position(std::istringstream& is) {
+     auto err = engine.set_position(fen, moves);
+     if (err.has_value())
+     {
++#ifdef CHESSIRO_WASM
++        positionOk = false;
++        sync_cout << "info string ERROR: Command `" << currentCmd
++                  << "` failed. Reason: " << err->what() << sync_endl;
++        return;
++#else
+         terminate_on_critical_error(err->what());
++#endif
+     }
++#ifdef CHESSIRO_WASM
++    positionOk = true;
++#endif
+ }
+ 
+ namespace {
+@@ -698,7 +759,13 @@ void UCIEngine::terminate_on_critical_error(const std::string& message) {
+     sync_cout << "info string CRITICAL ERROR: Command `" << currentCmd
+               << "` failed. Reason: " << message << '\n'
+               << sync_endl;
++#ifdef CHESSIRO_WASM
++    // In the browser the engine lives inside a Worker owned by the page. Killing
++    // it because of one malformed command is worse than ignoring the command.
++    return;
++#else
+     std::exit(1);
++#endif
+ }
+ 
+ }  // namespace Stockfish
+diff --git a/src/uci.h b/src/uci.h
+index 4d3c4cbb..9e5f93f4 100644
+--- a/src/uci.h
++++ b/src/uci.h
+@@ -43,6 +43,9 @@ class UCIEngine {
+ 
+     void loop();
+ 
++    // Processes one UCI command line; returns the leading token.
++    std::string process_command(const std::string& cmd);
++
+     static int         to_cp(Value v, const Position& pos);
+     static std::string format_score(const Score& s);
+     static std::string square(Square s);
+@@ -59,6 +62,8 @@ class UCIEngine {
+     Engine      engine;
+     CommandLine cli;
+     std::string currentCmd;
++    bool        limitsOk   = true;
++    bool        positionOk = true;
+ 
+     static void print_info_string(std::string_view str);
+ 
+@@ -76,9 +81,14 @@ class UCIEngine {
+ 
+     void init_search_update_listeners();
+ 
++#ifdef CHESSIRO_WASM
++    void terminate_on_critical_error(const std::string& message);
++#else
+     [[noreturn]] void terminate_on_critical_error(const std::string& message);
++#endif
+ };
+ 
++
+ }  // namespace Stockfish
+ 
+ #endif  // #ifndef UCI_H_INCLUDED
+-- 
+2.50.1 (Apple Git-155)
+
